@@ -1,8 +1,12 @@
 import os
 import multiprocessing
-from typing import BinaryIO
+from typing import BinaryIO, TypeAlias, Optional
 from collections import Counter, defaultdict
+from typing import DefaultDict
 import regex as re
+
+BpPos : TypeAlias = tuple[tuple[bytes, ...], int, int]
+Bp : TypeAlias = tuple[bytes, bytes]
 
 def find_chunk_boundaries(
     file: BinaryIO,
@@ -108,6 +112,7 @@ def train_bpe(
     with multiprocessing.Pool(len(boundaries)) as pool:
         list_of_pre_tk_cnts = pool.starmap(_process_chunk, chunk_args)
 
+    # bytes tuple(like split a word into bytes) : cnt
     agtd_pre_tk_cnts = defaultdict(int)
     for pre_tk_cnts in list_of_pre_tk_cnts:
         for tk, cnt in pre_tk_cnts.items():
@@ -116,44 +121,156 @@ def train_bpe(
     # BPE merge
     merge_times = vocab_size - len(vocab)
     
-    # used to index the pre-tokens of a bytes to efficiently merge
-    pre_tk_of_bytes = defaultdict(set[tuple[bytes, ...]])
+    # freq_dict: bytes pair tuple : cnt
     freq_dict = defaultdict(int)
+    # BpPos: (bytes tuple of a word, start, len)
+    # pos_map: bytes pair : list[BpPos]
+    pos_map: DefaultDict[
+                        tuple[bytes, bytes], 
+                        list[BpPos]
+    ] = defaultdict(list)
+
+    # prev_pos_map: pos : pos
+    prev_pos_map: dict[
+                        BpPos,
+                        BpPos
+    ] = {}
+
+    # prev_bp_map: pos : bp
+    prev_bp_map: dict[
+                        BpPos,
+                        Bp
+    ] = {}
+
+    # back_pos_map: pos : pos
+    back_pos_map: dict[
+                        BpPos,
+                        BpPos
+    ] = {}
+
+    # back_bp_map: pos : pos
+    back_bp_map: dict[
+                        BpPos,
+                        Bp
+    ] = {}
+
+    for wd_bytes_tp, cnt in agtd_pre_tk_cnts.items():
+        for idx, (bt0, bt1) in enumerate(zip(wd_bytes_tp[:-1], wd_bytes_tp[1:])):
+            mg_tp = (bt0, bt1)
+            freq_dict[mg_tp] += cnt
+
+            cur_pos : BpPos = (wd_bytes_tp, idx, 2)
+            pos_map[mg_tp].append(cur_pos)
+
+            if idx > 0:
+                prev_pos_map[cur_pos] = (wd_bytes_tp, idx - 1, 2)
+                prev_bp_map[cur_pos] = (wd_bytes_tp[idx - 1], bt0)
+            if idx + 2 < len(wd_bytes_tp):
+                back_pos_map[cur_pos] = (wd_bytes_tp, idx + 1, 2)
+                back_bp_map[cur_pos] = (bt1, wd_bytes_tp[idx + 2])
 
     for i in range(merge_times):
-        pre_tk_of_bytes.clear()
-        freq_dict.clear()
-
-        for tk_bytes_tp, cnt in agtd_pre_tk_cnts.items():
-            for bt0, bt1 in zip(tk_bytes_tp[:-1], tk_bytes_tp[1:]):
-                mg_tp = (bt0, bt1)
-                freq_dict[mg_tp] += cnt
-                pre_tk_of_bytes[mg_tp].add(tk_bytes_tp)
-
         most_freq_bp = max(freq_dict, key = lambda k : (freq_dict[k], k))
         bytes0, bytes1 = most_freq_bp
-        common_idxes = pre_tk_of_bytes[most_freq_bp]
 
-        for tk_bytes_tp in common_idxes:
-            new_tk_bytes : list[bytes] = []
+        merged_bp = bytes0 + bytes1
 
-            j = 0
-            while j < len(tk_bytes_tp):
-                bt = tk_bytes_tp[j]
-                if j + 1 < len(tk_bytes_tp) and bt == bytes0 and tk_bytes_tp[j+1] == bytes1:
-                    new_tk_bytes.append(bt + tk_bytes_tp[j+1])
-                    j += 2   
-                else:
-                    new_tk_bytes.append(bt)
-                    j += 1
-            
-            # update pre-token bytes tuple - cnt dict
-            new_tk_bytes_tp = tuple(new_tk_bytes)
-            cnt = agtd_pre_tk_cnts.pop(tk_bytes_tp)
-            agtd_pre_tk_cnts[new_tk_bytes_tp] = cnt
+        most_freq = freq_dict.pop(most_freq_bp)
+        
+        positions_to_process = list(pos_map[most_freq_bp])
+        for pos in positions_to_process:
+            times = agtd_pre_tk_cnts[pos[0]]
+            # 处理前驱
+            if pos in prev_pos_map:
+                prev_pos: BpPos = prev_pos_map[pos]
+                prev_bp:  Bp    = prev_bp_map[pos]
+                
+                # 创建新的前驱对和位置
+                new_prev_bp = (prev_bp[0], merged_bp)
+                new_prev_pos_tpl = (prev_pos[0], prev_pos[1], len(prev_bp[0]) + len(merged_bp))
+                new_prev_pos = BpPos(new_prev_pos_tpl)
 
-        # merge
+                # 更新频率
+                freq_dict[prev_bp] -= times
+                if freq_dict[prev_bp] == 0:
+                    freq_dict.pop(prev_bp)
+                freq_dict[new_prev_bp] += times
+                
+                # 更新 pos_map
+                pos_map[prev_bp].remove(prev_pos)
+                if not pos_map[prev_bp]:
+                    pos_map.pop(prev_bp)
+                pos_map[new_prev_bp].append(new_prev_pos)
+
+                # 更新双向链表
+                if prev_pos in prev_pos_map:
+                    # 更新前驱的前驱的后继
+                    prev_prev_pos = prev_pos_map[prev_pos]
+                    prev_prev_bp = prev_bp_map[prev_pos]
+                    back_pos_map[prev_prev_pos] = new_prev_pos
+                    back_bp_map[prev_prev_pos] = new_prev_bp
+
+                    prev_pos_map.pop(prev_pos)
+                    prev_pos_map[new_prev_pos] = prev_prev_pos
+
+                    prev_bp_map.pop(prev_pos)
+                    prev_bp_map[new_prev_pos] = prev_prev_bp
+
+            # 后继
+            if pos in back_pos_map:
+                back_pos: BpPos = back_pos_map[pos]
+                back_bp:  Bp   = back_bp_map[pos]
+
+                # 创建新的后继对和位置
+                new_back_bp = (merged_bp, back_bp[1])
+                new_back_pos_tpl = (back_pos[0], pos[1], len(merged_bp) + len(back_bp[1]))
+                new_back_pos = BpPos(new_back_pos_tpl)
+
+                # 更新频率
+                freq_dict[back_bp] -= times
+                if freq_dict[back_bp] == 0:
+                    freq_dict.pop(back_bp)
+                freq_dict[new_back_bp] += times
+
+                # 更新 pos_map
+                pos_map[back_bp].remove(back_pos)
+                if not pos_map[back_bp]:
+                    pos_map.pop(back_bp)
+                pos_map[new_back_bp].append(new_back_pos)
+
+                # 更新双向链表
+                if back_pos in back_pos_map:
+                    # 更新后继的后继的前驱
+                    back_back_pos = back_pos_map[back_pos]
+                    back_back_bp = back_bp_map[back_pos]
+                    prev_pos_map[back_back_pos] = new_back_pos
+                    prev_bp_map[back_back_pos] = new_back_bp
+
+                    back_pos_map.pop(back_pos)
+                    back_pos_map[new_back_pos] = back_back_pos
+
+                    back_bp_map.pop(back_pos)
+                    back_bp_map[new_back_pos] = back_back_bp
+
+            # 更新新节点之间的链接
+            if pos in prev_pos_map and pos in back_pos_map:
+                prev_pos_map.pop(pos)
+                prev_bp_map.pop(pos)
+                back_pos_map.pop(pos)
+                back_bp_map.pop(pos)
+                back_pos_map[new_prev_pos] = new_back_pos
+                prev_pos_map[new_back_pos] = new_prev_pos
+                back_bp_map[new_prev_pos] = new_back_bp
+                prev_bp_map[new_back_pos] = new_prev_bp
+
+        # 清理被合并的 bp
+        pos_map.pop(most_freq_bp, None)
+
         vocab[len(vocab)] = bytes0 + bytes1
         merges.append(most_freq_bp)
+
+        if most_freq_bp == (b'v', b'er'):
+            print(f"Final freq of (b'er', b's') is: {freq_dict.get((b'er', b's'))}\n")
+
 
     return vocab, merges
