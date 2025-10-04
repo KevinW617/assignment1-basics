@@ -104,7 +104,7 @@ def train_bpe(
 
     # parallelize pre-tokenization
     with open(input_path, 'rb') as f:
-        num_processes = min(os.cpu_count() or 1, 8)
+        num_processes = min(os.cpu_count() or 1, 64)
         boundaries = find_chunk_boundaries(f, num_processes, [t.encode('utf-8') for t in special_tokens])
 
     chunk_args = [(input_path, start, end, special_tokens) for start, end in zip(boundaries[:-1], boundaries[1:])]
@@ -177,8 +177,16 @@ def train_bpe(
 
         most_freq = freq_dict.pop(most_freq_bp)
         
+        # 使用一个集合来跟踪本轮已经处理过的位置，防止重复处理
+        # eg.  (b't', b'h', b'e', b'e', b'e')
+        processed_positions_this_turn = set()
+
         positions_to_process = list(pos_map[most_freq_bp])
         for pos in positions_to_process:
+            # 如果这个位置在本轮合并中已经被作为其他合并的一部分处理过，就跳过
+            if pos in processed_positions_this_turn:
+                continue
+
             times = agtd_pre_tk_cnts[pos[0]]
             # 处理前驱
             if pos in prev_pos_map:
@@ -216,6 +224,9 @@ def train_bpe(
                     prev_bp_map.pop(prev_pos)
                     prev_bp_map[new_prev_pos] = prev_prev_bp
 
+                # 将旧位置标记为已处理
+                processed_positions_this_turn.add(prev_pos)
+
             # 后继
             if pos in back_pos_map:
                 back_pos: BpPos = back_pos_map[pos]
@@ -251,6 +262,9 @@ def train_bpe(
 
                     back_bp_map.pop(back_pos)
                     back_bp_map[new_back_pos] = back_back_bp
+
+                # 将旧位置标记为已处理
+                processed_positions_this_turn.add(back_pos)
 
             # 更新新节点之间的链接
             if pos in prev_pos_map and pos in back_pos_map:
