@@ -269,8 +269,4 @@ def train_bpe(
         vocab[len(vocab)] = bytes0 + bytes1
         merges.append(most_freq_bp)
 
-        if most_freq_bp == (b'v', b'er'):
-            print(f"Final freq of (b'er', b's') is: {freq_dict.get((b'er', b's'))}\n")
-
-
     return vocab, merges
